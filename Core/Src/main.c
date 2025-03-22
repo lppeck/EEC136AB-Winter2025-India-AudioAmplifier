@@ -6,7 +6,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2024 STMicroelectronics.
+  * Copyright (c) 2025 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -18,12 +18,12 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "usbd_audio.h"
-#include "usbd_audio_if.h"
+#include "stdio.h"
+#include "string.h"
+#include "shared_memory.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,138 +47,217 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-DAC_HandleTypeDef hdac1;
+I2C_HandleTypeDef hi2c4;
 
-HRTIM_HandleTypeDef hhrtim;
-
-SPI_HandleTypeDef hspi1;
-
-TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim2;
+SPI_HandleTypeDef hspi4;
 
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-float t = 0.0;
+/* Define the I2C address for OLED and AS5600 */
+//#define OLED_I2C_ADDRESS   0x78  // Assuming 7-bit address shifted left by 1
+#define AS5600_I2C_ADDRESS 0x36 << 1  // 7-bit address for AS5600
 
-extern volatile int16_t audio_buffer[];
-extern volatile uint32_t audio_write_index;
-extern volatile uint32_t audio_read_index;
-extern volatile uint8_t new_packet;
+#define SHARED_MEMORY_BASE_ADDR 0x20020000
 
-volatile uint16_t timer_duty_cycle = 127;
+volatile float* shared_data_ptr = (float*)0x38000000;
 
-volatile float volume_buck_dc = 0.0;
-volatile float lerp_vol_buck_dc = 0.0;
+#define OLED_CS_PIN     GPIO_PIN_10 // Modify as per your setup (Chip select pin for SPI)
+#define OLED_DC_PIN      GPIO_PIN_15
+#define OLED_RST_PIN      GPIO_PIN_7
+#define OLED_GPIO_PORT    GPIOE       // Modify as per your setup (Chip select GPIO port)
+#define OLED_WIDTH          128
+#define OLED_HEIGHT         64
+#define OLED_PAGES (OLED_HEIGHT/8)
 
-volatile uint32_t timer_count = 0;
-volatile uint32_t repeat_counter = 0;
+uint8_t buffer[OLED_WIDTH * OLED_PAGES];
 
-volatile uint32_t timer_period = 4200;
+static float absoluteAngle = 0.0;
+static uint16_t prevRawAngle = 0;
+static uint32_t lastVolumeChangeTime = 0;
+static int volume = 0;
+static uint8_t showVolumeUI = 0;  // Boolean flag
 
-volatile uint32_t difference;
-
-float* encoder_data = (float*)0x38000000; //Start of SRAM4
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_I2C4_Init(void);
+static void MX_SPI4_Init(void);
 static void MX_USART3_UART_Init(void);
-static void MX_HRTIM_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_DAC1_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-	HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_1); //for debugging, to see the actual frequency this loop runs at.
 
-	timer_count++;
-
-	float dBW_value = (*encoder_data * (30.0/360.0)) - 14.0;
-	volume_buck_dc = ((127.0 / 20.0) * sqrt(8 * pow(10, dBW_value * 0.1)));
-
-	lerp_vol_buck_dc = ((volume_buck_dc - lerp_vol_buck_dc) * 0.0001) + lerp_vol_buck_dc;
-	TIM1->CCR1 = (uint32_t)lerp_vol_buck_dc;
-
-
-
-
-
-	if(new_packet == 1)
-	{
-		new_packet = 0;
-		timer_count = 0;
-		//uint8_t uart_buff[32];
-		//uint8_t strlength = sprintf(uart_buff, "avg: %u\r\n", avg_timer_count);
-		//HAL_UART_Transmit(&huart3, uart_buff, strlength, 10000);
-
-		repeat_counter++;
-		if(repeat_counter == 100)
-		{
-			repeat_counter = 0;
-
-			if(audio_write_index < audio_read_index)
-			{
-				difference = audio_write_index + AUDIO_BUFFER_SIZE - audio_read_index;
-			}
-			else
-			{
-				difference = audio_write_index - audio_read_index;
-			}
-
-			if(difference > 7000)
-			{
-				timer_period -= 1;
-			}
-			else if(difference < 3000)
-			{
-				timer_period += 1;
-			}
-
-			__HAL_TIM_SET_AUTORELOAD(&htim2, (uint32_t)timer_period);
-		}
-
-
-
-
-		int16_t sample = audio_buffer[audio_read_index]; //get the sample from the array
-		audio_read_index = (audio_read_index + 2) % AUDIO_BUFFER_SIZE; //increment array index, and roll over array
-
-		timer_duty_cycle = 255 + (sample / 130); //scale to a range of 127+-94
-	}
-	else
-	{
-		if(timer_count > 60) //A Packet is very late (should be 48 counts)
-		{
-			timer_duty_cycle = 255;
-			timer_count = 60;
-		}
-		else
-		{
-			int16_t sample = audio_buffer[audio_read_index]; //get the sample from the array
-			audio_read_index = (audio_read_index + 2) % AUDIO_BUFFER_SIZE; //increment array index, and roll over array
-
-			timer_duty_cycle = 255 + (sample / 130); //scale to a range of 127+-94
-		}
-	}
-
-	__HAL_HRTIM_SETCOMPARE(&hhrtim, 0x0, HRTIM_COMPAREUNIT_1, timer_duty_cycle); //Set the PWM duty cycle
-	//uint16_t DAC_level = (uint16_t)(sample + 32768);
-	//HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_L, DAC_level);
-
-	//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-	//HAL_SPI_Transmit(&hspi1, (uint8_t*)&sample, 2, 10);
-	//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
-
-}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void OLED_Init();
+void OLED_Command(uint8_t cmd);
+void OLED_Data(uint8_t data);
+void OLED_Update();
+void OLED_Clear();
+void drawVolumeBar(int volume);
+//void OLED_Init_SPI(void);
+
+//void OLED_PrintVolume_SPI(uint8_t volume);
+uint16_t readAS5600Angle();
+uint8_t MapPositionToVolume(uint16_t position);
+
+//read angle from encoder
+void debug_print(const char *msg) {
+    HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+// --- AS5600 Read Angle Function ---
+uint16_t readAS5600Angle() {
+    uint8_t reg = 0x0C; // RAW ANGLE register
+    uint8_t buffer[2];
+    uint16_t angle;
+
+    HAL_I2C_Master_Transmit(&hi2c4, AS5600_I2C_ADDRESS, &reg, 1, HAL_MAX_DELAY);
+    HAL_I2C_Master_Receive(&hi2c4, AS5600_I2C_ADDRESS, buffer, 2, HAL_MAX_DELAY);
+
+    angle = ((buffer[0] << 8) | buffer[1]) & 0x0FFF;  // 12-bit angle value
+    return angle;
+}
+
+// --- OLED SPI Communication ---
+void OLED_Command(uint8_t command) {
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_DC_PIN, GPIO_PIN_RESET); // DC = 0 (Command)
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_RESET); // CS = 0
+    HAL_SPI_Transmit(&hspi4, &command, 1, HAL_MAX_DELAY);
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_SET);   // CS = 1
+}
+
+void OLED_Data(uint8_t data) {
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_DC_PIN, GPIO_PIN_SET); // DC = 1 (Data)
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_RESET); // CS = 0
+    HAL_SPI_Transmit(&hspi4, &data, 1, HAL_MAX_DELAY);
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_SET);   // CS = 1
+}
+
+// --- OLED Initialization ---
+void OLED_Init() {
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_RST_PIN, GPIO_PIN_RESET); // Reset OLED
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_RST_PIN, GPIO_PIN_SET);   // Release Reset
+
+    OLED_Command(0xAE); // Display OFF
+    OLED_Command(0xD5); OLED_Command(0x80); // Display Clock
+    OLED_Command(0xA8); OLED_Command(0x3F); // Multiplex Ratio
+    OLED_Command(0xD3); OLED_Command(0x00); // Display Offset
+    OLED_Command(0x40); // Display Start Line
+    OLED_Command(0xA1); // Segment Remap
+    OLED_Command(0xC8); // COM Output Scan Direction
+    OLED_Command(0xDA); OLED_Command(0x12); // COM Pins Configuration
+    OLED_Command(0x81); OLED_Command(0x7F); // Contrast
+    OLED_Command(0xD9); OLED_Command(0xF1); // Pre-charge Period
+    OLED_Command(0xDB); OLED_Command(0x40); // VCOMH Deselect Level
+    OLED_Command(0xA4); // Entire Display ON
+    OLED_Command(0xA6); // Normal Display
+    OLED_Command(0x8D); OLED_Command(0x14); // Enable Charge Pump
+    OLED_Command(0xAF); // Display ON
+}
+
+// --- OLED Update (Page Addressing Mode) ---
+void OLED_Update() {
+    for (uint8_t page = 0; page < OLED_PAGES; page++) {
+        OLED_Command(0xB0 + page); // Set Page Address
+        OLED_Command(0x00); // Lower Column Start Address
+        OLED_Command(0x10); // Upper Column Start Address
+
+        HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_DC_PIN, GPIO_PIN_SET); // DC = 1 (Data)
+        HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_RESET); // CS = 0
+        HAL_SPI_Transmit(&hspi4, &buffer[page * OLED_WIDTH], OLED_WIDTH, HAL_MAX_DELAY);
+        HAL_GPIO_WritePin(OLED_GPIO_PORT, OLED_CS_PIN, GPIO_PIN_SET); // CS = 1
+    }
+}
+
+// --- Clear Display Buffer ---
+void OLED_Clear() {
+    memset(buffer, 0, sizeof(buffer));
+    OLED_Update();
+}
+
+void drawVolumeBar(int volume) {
+    // Clear only the bar area
+    memset(&buffer[(OLED_HEIGHT - 8) / 8 * OLED_WIDTH], 0, OLED_WIDTH);
+
+    int width = (volume * OLED_WIDTH) / 100; // Scale volume to OLED width
+    int y = OLED_HEIGHT - 8;  // Position at the bottom (last row of pixels)
+
+    for (int x = 0; x < width; x++) {
+        buffer[x + (y / 8) * OLED_WIDTH] = 0xFF;  // Draw a filled bar
+    }
+}
+
+const uint8_t font6x8[][6] = {
+    {0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00}, // 0
+    {0x00, 0x42, 0x7F, 0x40, 0x00, 0x00}, // 1
+    {0x72, 0x49, 0x49, 0x49, 0x46, 0x00}, // 2
+    {0x21, 0x41, 0x45, 0x4B, 0x31, 0x00}, // 3
+    {0x18, 0x14, 0x12, 0x7F, 0x10, 0x00}, // 4
+    {0x27, 0x45, 0x45, 0x45, 0x39, 0x00}, // 5
+    {0x3E, 0x49, 0x49, 0x49, 0x30, 0x00}, // 6
+    {0x01, 0x71, 0x09, 0x05, 0x03, 0x00}, // 7
+    {0x36, 0x49, 0x49, 0x49, 0x36, 0x00}, // 8
+    {0x06, 0x49, 0x49, 0x29, 0x1E, 0x00}, // 9
+};
+
+void drawChar(int x, int y, char c) {
+    int index;
+    if (c >= '0' && c <= '9') {
+        index = c - '0'; // Get digit index
+    } else if (c == '%') {
+        index = 10; // '%' symbol
+    } else {
+        return; // Ignore unsupported characters
+    }
+
+    for (int col = 0; col < 6; col++) {
+        for (int row = 0; row < 8; row++) {
+            if (font6x8[index][col] & (1 << row)) {
+                int pixelIndex = (y + row) / 8 * OLED_WIDTH + (x + col);
+                buffer[pixelIndex] |= (1 << ((y + row) % 8));
+            }
+        }
+    }
+}
+
+// Draw text at (x, y)
+void drawText(int x, int y, const char *text) {
+    while (*text) {
+        drawChar(x, y, *text);
+        x += 6; // Move cursor for next character
+        text++;
+    }
+}
+
+void drawWaveAnimation(uint8_t frameOffset) {
+    for (int x = 0; x < OLED_WIDTH; x++) {
+        int yOffset = 5 + (int)(4 * sin((x + frameOffset) * 0.2)); // Small wave oscillation
+        int pixelIndex = (yOffset / 8) * OLED_WIDTH + x;
+        buffer[pixelIndex] |= (1 << (yOffset % 8));
+    }
+}
+
+void OLED_DrawPixel(int x, int y, uint8_t color) {
+    if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) return;
+
+    if (color) {
+        buffer[x + (y / 8) * OLED_WIDTH] |= (1 << (y % 8));  // Set pixel
+    } else {
+        buffer[x + (y / 8) * OLED_WIDTH] &= ~(1 << (y % 8)); // Clear pixel
+    }
+}
+
+
+void drawLine(int x1, int y1, int x2, int y2) {
+    for (int x = x1; x <= x2; x++) {
+        OLED_DrawPixel(x, y1, 1);  // Draw a pixel at (x, y1)
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -190,21 +269,25 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  /* Initialize peripherals */
+	  HAL_Init();
+
 
   /* USER CODE END 1 */
-/* USER CODE BEGIN Boot_Mode_Sequence_0 */
-  int32_t timeout;
-/* USER CODE END Boot_Mode_Sequence_0 */
-
-  /* Enable the CPU Cache */
-
-  /* Enable I-Cache---------------------------------------------------------*/
-  SCB_EnableICache();
-
-  /* Enable D-Cache---------------------------------------------------------*/
-  SCB_EnableDCache();
 
 /* USER CODE BEGIN Boot_Mode_Sequence_1 */
+	  /* HW semaphore Clock enable */
+	    __HAL_RCC_HSEM_CLK_ENABLE();
+	    /* Activate HSEM notification for Cortex-M4 */
+	    HAL_HSEM_ActivateNotification(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+	    /* Domain D2 goes to STOP mode (Cortex-M4 in deep-sleep) waiting for Cortex-M7 to
+	       perform system initialization (system clock config, external memory configuration.. )
+	    */
+	    HAL_PWREx_ClearPendingEvent();
+	    HAL_PWREx_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFE, PWR_D2_DOMAIN);
+	    /* Clear HSEM flag */
+	    __HAL_HSEM_CLEAR_FLAG(__HAL_HSEM_SEMID_TO_MASK(HSEM_ID_0));
+
 /* USER CODE END Boot_Mode_Sequence_1 */
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -215,59 +298,19 @@ int main(void)
 
   /* USER CODE END Init */
 
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* Configure the peripherals common clocks */
-  PeriphCommonClock_Config();
-/* USER CODE BEGIN Boot_Mode_Sequence_2 */
-/* When system initialization is finished, Cortex-M7 will release Cortex-M4 by means of
-HSEM notification */
-/*HW semaphore Clock enable*/
-__HAL_RCC_HSEM_CLK_ENABLE();
-/*Take HSEM */
-HAL_HSEM_FastTake(HSEM_ID_0);
-/*Release HSEM in order to notify the CPU2(CM4)*/
-HAL_HSEM_Release(HSEM_ID_0,0);
-/* wait until CPU2 wakes up from stop mode */
-timeout = 0xFFFF;
-while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) == RESET) && (timeout-- > 0));
-if ( timeout < 0 )
-{
-Error_Handler();
-}
-/* USER CODE END Boot_Mode_Sequence_2 */
-
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C4_Init();
+  MX_SPI4_Init();
   MX_USART3_UART_Init();
-  MX_USB_DEVICE_Init();
-  MX_HRTIM_Init();
-  MX_TIM2_Init();
-  MX_DAC1_Init();
-  MX_SPI1_Init();
-  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-  HAL_HRTIM_WaveformOutputStart(&hhrtim, HRTIM_OUTPUT_TA1); //ENABLE PWM GPIO OUTPUTS
-  HAL_HRTIM_WaveformOutputStart(&hhrtim, HRTIM_OUTPUT_TA2);
-  HAL_HRTIM_WaveformCounterStart(&hhrtim, HRTIM_TIMERID_TIMER_A);  // Start the counter of the Timer A operating in waveform mode
-
-
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_Base_Start(&htim1);
-  //HAL_TIM_RegisterCallback(&htim2, HAL_TIM_PERIOD_ELAPSED_CB_ID, Clock48KHz); //IDK why this doesn't work tbh
-  HAL_TIM_Base_Start_IT(&htim2); //Start the TIMER 2 clock for 48KHz interrupt
-
-  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1); //start output of dac channel 1
-
-  __HAL_TIM_SET_AUTORELOAD(&htim2, (uint32_t)timer_period);
-
-
+  OLED_Init();
+    OLED_Clear();
+    uint32_t frameCounter = 0; // Keeps the wave moving continuously
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -277,68 +320,58 @@ Error_Handler();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+	  uint16_t rawAngle = readAS5600Angle();
+	        int delta = rawAngle - prevRawAngle;
+
+	        if (delta > 2048) {
+	            delta -= 4096;
+	        } else if (delta < -2048) {
+	            delta += 4096;
+	        }
+
+	        absoluteAngle += (delta * (360.0 / 4096.0));
+	        if (absoluteAngle > 360.0) absoluteAngle = 360.0;
+	        if (absoluteAngle < 0.0) absoluteAngle = 0.0;
+
+	        /////////
+	        *shared_data_ptr = absoluteAngle;
+			/////////
+
+	        int newVolume = (absoluteAngle * 100) / 360;
+
+	        if (newVolume != volume) {
+	            volume = newVolume;
+	            lastVolumeChangeTime = HAL_GetTick();
+	            showVolumeUI = 1;
+	        }
+
+	        uint32_t elapsedTime = HAL_GetTick() - lastVolumeChangeTime;
+
+	        // Clear only the areas that need to be updated
+	        memset(buffer, 0, sizeof(buffer));
+
+	        // Show wave only if active within 3 seconds
+	        if (elapsedTime < 3000) {
+	            drawWaveAnimation(frameCounter); // Draw wave first (background)
+
+	            drawVolumeBar(volume); // Draw volume bar
+	            char volumeText[5];
+	            sprintf(volumeText, "%d%%", volume);
+	            drawText(64 - (strlen(volumeText) * 3), 32, volumeText);
+	        }
+
+	        OLED_Update();
+
+	        prevRawAngle = rawAngle;
+	        frameCounter++;  // Increment wave animation frame
+	        /*uint8_t uart_buff[32];
+	        uint8_t strlength = sprintf(uart_buff, "Volume: %u\r\n", newVolume);
+	        HAL_UART_Transmit(&huart3, uart_buff, strlength, 10000);*/
+	        HAL_Delay(16);   // ~60 FPS for smooth animation
+
+
+	    }
   /* USER CODE END 3 */
-}
-
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Supply configuration update enable
-  */
-  HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
-
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 50;
-  RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
-  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
-  RCC_OscInitStruct.PLL.PLLFRACN = 0;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
-                              |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
 }
 
 /**
@@ -360,314 +393,98 @@ void PeriphCommonClock_Config(void)
 }
 
 /**
-  * @brief DAC1 Initialization Function
+  * @brief I2C4 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_DAC1_Init(void)
+static void MX_I2C4_Init(void)
 {
 
-  /* USER CODE BEGIN DAC1_Init 0 */
+  /* USER CODE BEGIN I2C4_Init 0 */
 
-  /* USER CODE END DAC1_Init 0 */
+  /* USER CODE END I2C4_Init 0 */
 
-  DAC_ChannelConfTypeDef sConfig = {0};
+  /* USER CODE BEGIN I2C4_Init 1 */
 
-  /* USER CODE BEGIN DAC1_Init 1 */
-
-  /* USER CODE END DAC1_Init 1 */
-
-  /** DAC Initialization
-  */
-  hdac1.Instance = DAC1;
-  if (HAL_DAC_Init(&hdac1) != HAL_OK)
+  /* USER CODE END I2C4_Init 1 */
+  hi2c4.Instance = I2C4;
+  hi2c4.Init.Timing = 0x10C0ECFF;
+  hi2c4.Init.OwnAddress1 = 0;
+  hi2c4.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c4.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c4.Init.OwnAddress2 = 0;
+  hi2c4.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c4.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c4.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c4) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** DAC channel OUT1 config
+  /** Configure Analogue filter
   */
-  sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
-  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
-  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
-  sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
-  sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
-  if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c4, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN DAC1_Init 2 */
 
-  /* USER CODE END DAC1_Init 2 */
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c4, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C4_Init 2 */
+
+  /* USER CODE END I2C4_Init 2 */
 
 }
 
 /**
-  * @brief HRTIM Initialization Function
+  * @brief SPI4 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_HRTIM_Init(void)
+static void MX_SPI4_Init(void)
 {
 
-  /* USER CODE BEGIN HRTIM_Init 0 */
+  /* USER CODE BEGIN SPI4_Init 0 */
 
-  /* USER CODE END HRTIM_Init 0 */
+  /* USER CODE END SPI4_Init 0 */
 
-  HRTIM_TimeBaseCfgTypeDef pTimeBaseCfg = {0};
-  HRTIM_TimerCfgTypeDef pTimerCfg = {0};
-  HRTIM_CompareCfgTypeDef pCompareCfg = {0};
-  HRTIM_DeadTimeCfgTypeDef pDeadTimeCfg = {0};
-  HRTIM_OutputCfgTypeDef pOutputCfg = {0};
+  /* USER CODE BEGIN SPI4_Init 1 */
 
-  /* USER CODE BEGIN HRTIM_Init 1 */
-
-  /* USER CODE END HRTIM_Init 1 */
-  hhrtim.Instance = HRTIM1;
-  hhrtim.Init.HRTIMInterruptResquests = HRTIM_IT_NONE;
-  hhrtim.Init.SyncOptions = HRTIM_SYNCOPTION_NONE;
-  if (HAL_HRTIM_Init(&hhrtim) != HAL_OK)
+  /* USER CODE END SPI4_Init 1 */
+  /* SPI4 parameter configuration*/
+  hspi4.Instance = SPI4;
+  hspi4.Init.Mode = SPI_MODE_MASTER;
+  hspi4.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi4.Init.NSS = SPI_NSS_SOFT;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi4.Init.CRCPolynomial = 0x0;
+  hspi4.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi4.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi4.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi4.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi4.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi4.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi4.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi4.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi4.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi4.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi4) != HAL_OK)
   {
     Error_Handler();
   }
-  pTimeBaseCfg.Period = 0x001FF;
-  pTimeBaseCfg.RepetitionCounter = 0x00;
-  pTimeBaseCfg.PrescalerRatio = HRTIM_PRESCALERRATIO_DIV1;
-  pTimeBaseCfg.Mode = HRTIM_MODE_CONTINUOUS;
-  if (HAL_HRTIM_TimeBaseConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, &pTimeBaseCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pTimerCfg.InterruptRequests = HRTIM_TIM_IT_NONE;
-  pTimerCfg.DMARequests = HRTIM_TIM_DMA_NONE;
-  pTimerCfg.DMASrcAddress = 0x0000;
-  pTimerCfg.DMADstAddress = 0x0000;
-  pTimerCfg.DMASize = 0x1;
-  pTimerCfg.HalfModeEnable = HRTIM_HALFMODE_DISABLED;
-  pTimerCfg.StartOnSync = HRTIM_SYNCSTART_DISABLED;
-  pTimerCfg.ResetOnSync = HRTIM_SYNCRESET_DISABLED;
-  pTimerCfg.DACSynchro = HRTIM_DACSYNC_NONE;
-  pTimerCfg.PreloadEnable = HRTIM_PRELOAD_ENABLED;
-  pTimerCfg.UpdateGating = HRTIM_UPDATEGATING_INDEPENDENT;
-  pTimerCfg.BurstMode = HRTIM_TIMERBURSTMODE_MAINTAINCLOCK;
-  pTimerCfg.RepetitionUpdate = HRTIM_UPDATEONREPETITION_ENABLED;
-  pTimerCfg.PushPull = HRTIM_TIMPUSHPULLMODE_DISABLED;
-  pTimerCfg.FaultEnable = HRTIM_TIMFAULTENABLE_NONE;
-  pTimerCfg.FaultLock = HRTIM_TIMFAULTLOCK_READWRITE;
-  pTimerCfg.DeadTimeInsertion = HRTIM_TIMDEADTIMEINSERTION_ENABLED;
-  pTimerCfg.DelayedProtectionMode = HRTIM_TIMER_A_B_C_DELAYEDPROTECTION_DISABLED;
-  pTimerCfg.UpdateTrigger = HRTIM_TIMUPDATETRIGGER_NONE;
-  pTimerCfg.ResetTrigger = HRTIM_TIMRESETTRIGGER_NONE;
-  pTimerCfg.ResetUpdate = HRTIM_TIMUPDATEONRESET_DISABLED;
-  if (HAL_HRTIM_WaveformTimerConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, &pTimerCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pCompareCfg.CompareValue = 0xFF;
-  if (HAL_HRTIM_WaveformCompareConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, HRTIM_COMPAREUNIT_1, &pCompareCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pDeadTimeCfg.Prescaler = HRTIM_TIMDEADTIME_PRESCALERRATIO_DIV1;
-  pDeadTimeCfg.RisingValue = 0x2;
-  pDeadTimeCfg.RisingSign = HRTIM_TIMDEADTIME_RISINGSIGN_POSITIVE;
-  pDeadTimeCfg.RisingLock = HRTIM_TIMDEADTIME_RISINGLOCK_WRITE;
-  pDeadTimeCfg.RisingSignLock = HRTIM_TIMDEADTIME_RISINGSIGNLOCK_READONLY;
-  pDeadTimeCfg.FallingValue = 0x2;
-  pDeadTimeCfg.FallingSign = HRTIM_TIMDEADTIME_FALLINGSIGN_POSITIVE;
-  pDeadTimeCfg.FallingLock = HRTIM_TIMDEADTIME_FALLINGLOCK_WRITE;
-  pDeadTimeCfg.FallingSignLock = HRTIM_TIMDEADTIME_FALLINGSIGNLOCK_READONLY;
-  if (HAL_HRTIM_DeadTimeConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, &pDeadTimeCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pOutputCfg.Polarity = HRTIM_OUTPUTPOLARITY_HIGH;
-  pOutputCfg.SetSource = HRTIM_OUTPUTSET_TIMPER;
-  pOutputCfg.ResetSource = HRTIM_OUTPUTRESET_TIMCMP1;
-  pOutputCfg.IdleMode = HRTIM_OUTPUTIDLEMODE_NONE;
-  pOutputCfg.IdleLevel = HRTIM_OUTPUTIDLELEVEL_INACTIVE;
-  pOutputCfg.FaultLevel = HRTIM_OUTPUTFAULTLEVEL_INACTIVE;
-  pOutputCfg.ChopperModeEnable = HRTIM_OUTPUTCHOPPERMODE_DISABLED;
-  pOutputCfg.BurstModeEntryDelayed = HRTIM_OUTPUTBURSTMODEENTRY_DELAYED;
-  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, HRTIM_OUTPUT_TA1, &pOutputCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  pOutputCfg.SetSource = HRTIM_OUTPUTSET_NONE;
-  pOutputCfg.ResetSource = HRTIM_OUTPUTRESET_NONE;
-  pOutputCfg.FaultLevel = HRTIM_OUTPUTFAULTLEVEL_NONE;
-  pOutputCfg.BurstModeEntryDelayed = HRTIM_OUTPUTBURSTMODEENTRY_REGULAR;
-  if (HAL_HRTIM_WaveformOutputConfig(&hhrtim, HRTIM_TIMERINDEX_TIMER_A, HRTIM_OUTPUT_TA2, &pOutputCfg) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN HRTIM_Init 2 */
+  /* USER CODE BEGIN SPI4_Init 2 */
 
-  /* USER CODE END HRTIM_Init 2 */
-  HAL_HRTIM_MspPostInit(&hhrtim);
-
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES_TXONLY;
-  hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 0x0;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
-  hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
-  hspi1.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi1.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
-  hspi1.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
-  hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
-  hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
-  hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 127;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 512;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 1;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
-  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
-  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
-  sBreakDeadTimeConfig.Break2Filter = 0;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 66;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
+  /* USER CODE END SPI4_Init 2 */
 
 }
 
@@ -731,72 +548,25 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_7|GPIO_PIN_10|GPIO_PIN_15, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_14, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PC1 PC4 PC5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_4|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  /*Configure GPIO pins : PE7 PE10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_7|GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA1 PA2 PA7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA6 */
-  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  /*Configure GPIO pin : PE15 */
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB0 PB14 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_14;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PG11 PG13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
-  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PE1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -814,7 +584,6 @@ static void MX_GPIO_Init(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
